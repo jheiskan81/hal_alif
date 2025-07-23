@@ -11,6 +11,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/__assert.h>
 #include <zephyr/logging/log.h>
@@ -27,6 +28,63 @@ LOG_MODULE_REGISTER(hci_uart, CONFIG_UART_LOG_LEVEL);
 /* change this to any other UART peripheral if desired */
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_hci_uart)
 static const struct device *uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+
+#define BUFF_SIZE 32
+
+static bool pingpong;
+static uint8_t rx_buffer[2][BUFF_SIZE];
+/* Wait for specific message from AHI */
+static K_SEM_DEFINE(hci_tx_sem, 0, 1);
+static K_SEM_DEFINE(hci_rx_sem, 0, 1);
+
+#define MY_RING_BUF_BYTES 256
+RING_BUF_DECLARE(hci_ring_buf, MY_RING_BUF_BYTES);
+
+struct hci_rx_job {
+	struct k_work work;
+	uint8_t *buf;
+	uint32_t size;
+	void (*callback)(void *, uint8_t);
+	void *metadata;
+};
+
+K_KERNEL_STACK_DEFINE(hci_worker_stack, 2048);
+static struct k_work_q hci_worker_queue;
+
+
+static void hci_rx_handle_func(struct k_work *work)
+{
+	struct hci_rx_job *job = CONTAINER_OF(work, struct hci_rx_job, work);
+
+	int remaining = job->size;
+
+	//LOG_INF("HCI RX handle func: %d bytes", remaining);
+
+	while (0 < remaining) {
+		/* Read Pending data */
+		if (ring_buf_is_empty(&hci_ring_buf)) {
+			k_sem_take(&hci_rx_sem, K_FOREVER);
+		}
+
+		int read_bytes = ring_buf_get(&hci_ring_buf, job->buf, remaining);
+		if (read_bytes < 0) {
+			//k_sem_take(&hci_rx_sem, K_FOREVER);
+			continue;
+		}
+		remaining -= read_bytes;
+		job->buf += read_bytes;
+		//LOG_INF("HCI RX handle func: get %dB (remaining %dB)", read_bytes, remaining);
+	}
+
+	if (job->callback) {
+		job->callback(job->metadata, ITF_STATUS_OK);
+	}
+}
+
+static struct hci_rx_job hci_rx_job = {
+	.work = Z_WORK_INITIALIZER(hci_rx_handle_func),
+};
+
 
 /*
  * STRUCT DEFINITIONS
@@ -55,8 +113,6 @@ struct uart_env_tag {
 	bool ext_wakeup;
 	/* Flag to track if RX is active */
 	bool rx_enabled;
-	/* Flag to track if TX is active */
-	bool tx_active;
 };
 
 /* receive buffer used in UART callback */
@@ -84,103 +140,49 @@ static void hci_uart_async_callback(const struct device *dev, struct uart_event 
 	void (*callback)(void *, uint8_t) = NULL;
 	void *data = NULL;
 
-	LOG_DBG("UART async event: %d", evt->type);
-
 	switch (evt->type) {
 	case UART_TX_DONE:
 		/* TX completed successfully */
 		LOG_DBG("UART TX completed successfully");
-		uart_env.tx_active = false;
-		callback = uart_env.tx.callback;
-		data = uart_env.tx.dummy;
-
-		if (callback != NULL) {
-			/* Clear callback pointer */
-			uart_env.tx.callback = NULL;
-			uart_env.tx.dummy = NULL;
-
-			/* Call handler */
-			callback(data, ITF_STATUS_OK);
-		}
+		k_sem_give(&hci_tx_sem);
 		break;
 
 	case UART_TX_ABORTED:
 		/* TX was aborted */
-		LOG_WRN("UART TX was aborted, sent %d bytes", evt->data.tx.len);
-		uart_env.tx_active = false;
+		LOG_ERR("UART TX was aborted, sent %d bytes", evt->data.tx.len);
 		callback = uart_env.tx.callback;
 		data = uart_env.tx.dummy;
-
-		if (callback != NULL) {
-			/* Clear callback pointer */
-			uart_env.tx.callback = NULL;
-			uart_env.tx.dummy = NULL;
-
-			/* Call handler with error status */
-			callback(data, ITF_STATUS_ERROR);
-		}
+		k_sem_give(&hci_tx_sem);
 		break;
 
 	case UART_RX_RDY:
 		/* Data received and ready for processing */
-		LOG_DBG("UART RX data ready: %d bytes", evt->data.rx.len);
-		rx_buf_len = evt->data.rx.len;
-
-		/* If we've received the expected amount of data, notify the callback */
-		if (rx_buf_len == rx_buf_size) {
-			LOG_DBG("UART RX complete, received %d bytes", rx_buf_len);
-			uart_env.rx_enabled = false;
-			uart_rx_disable(uart_dev);
-
-			callback = uart_env.rx.callback;
-			data = uart_env.rx.dummy;
-
-			if (callback != NULL) {
-				/* Clear callback pointer */
-				uart_env.rx.callback = NULL;
-				uart_env.rx.dummy = NULL;
-
-				/* Call handler */
-				callback(data, ITF_STATUS_OK);
-			}
-		}
+		char *p_start = evt->data.rx.buf + evt->data.rx.offset;
+		/* Push To ring buffer */
+		ring_buf_put(&hci_ring_buf, p_start, evt->data.rx.len);
+		k_sem_give(&hci_rx_sem);
 		break;
 
 	case UART_RX_BUF_REQUEST:
 		/* UART driver is requesting a new buffer for continuous reception */
-		LOG_DBG("UART RX buffer request - not providing additional buffer");
-		/* We're not providing an additional buffer as we want to process the data
-		 * when the current buffer is filled or when a timeout occurs.
-		 * This will cause the reception to stop when the current buffer is full.
-		 */
+		//LOG_INF("BUFREG");
+		pingpong ^= true;
+		uart_rx_buf_rsp(dev, rx_buffer[pingpong], BUFF_SIZE);
 		break;
 
 	case UART_RX_BUF_RELEASED:
 		/* Buffer has been released */
-		LOG_DBG("UART RX buffer released");
 		break;
 
 	case UART_RX_DISABLED:
 		/* RX has been disabled */
-		LOG_DBG("UART RX disabled");
 		uart_env.rx_enabled = false;
 		break;
 
 	case UART_RX_STOPPED:
 		/* RX has been stopped due to error */
-		LOG_WRN("UART RX stopped due to error: %d", evt->data.rx_stop.reason);
+		LOG_ERR("UART RX stopped due to error: %d", evt->data.rx_stop.reason);
 		uart_env.rx_enabled = false;
-		callback = uart_env.rx.callback;
-		data = uart_env.rx.dummy;
-
-		if (callback != NULL) {
-			/* Clear callback pointer */
-			uart_env.rx.callback = NULL;
-			uart_env.rx.dummy = NULL;
-
-			/* Call handler with error status */
-			callback(data, ITF_STATUS_ERROR);
-		}
 		break;
 
 	default:
@@ -254,6 +256,20 @@ int32_t hci_uart_init(void)
 		LOG_ERR("Failed to set UART callback: %d", ret);
 		return ret;
 	}
+	/* Create Receiver worker */
+	k_work_queue_start(&hci_worker_queue, hci_worker_stack,
+			   K_KERNEL_STACK_SIZEOF(hci_worker_stack),
+			   CONFIG_ALIF_BLE_HOST_THREAD_PRIORITY - 1, NULL);
+	k_thread_name_set(&hci_worker_queue.thread, "hci_worker");
+
+	uart_rx_disable(uart_dev);
+	uart_irq_rx_disable(uart_dev);
+	ret = uart_rx_enable(uart_dev, rx_buffer[pingpong], BUFF_SIZE, RX_TIMEOUT_US);
+	if (ret < 0) {
+		LOG_ERR("Failed to enable UART: %d", ret);
+		return ret;
+	}
+	uart_env.rx_enabled = true;
 #else  /* !CONFIG_UART_ASYNC_API */
 	uart_irq_rx_enable(uart_dev);
 	uart_irq_callback_user_data_set(uart_dev, hci_uart_callback, NULL);
@@ -264,6 +280,7 @@ int32_t hci_uart_init(void)
 	 * read operation is started a (new) callback is always set.
 	 */
 	uart_env.tx.callback = NULL;
+	uart_env.rx.callback = NULL;
 	return 0;
 }
 
@@ -275,20 +292,6 @@ void hci_uart_read(uint8_t *bufptr, uint32_t size, void (*callback)(void *, uint
 	__ASSERT(size != 0, "Invalid size");
 	__ASSERT(callback != NULL, "Invalid callback");
 
-#if CONFIG_UART_ASYNC_API
-	/* If RX is already enabled, disable it first */
-	if (uart_env.rx_enabled) {
-		int ret = uart_rx_disable(uart_dev);
-
-		if (ret < 0) {
-			LOG_ERR("Failed to disable UART RX: %d", ret);
-			/* Call callback with error status */
-			callback(dummy, ITF_STATUS_ERROR);
-			return;
-		}
-		uart_env.rx_enabled = false;
-	}
-#endif /* CONFIG_UART_ASYNC_API */
 
 	/* Store callback and user data */
 	uart_env.rx.callback = callback;
@@ -301,24 +304,32 @@ void hci_uart_read(uint8_t *bufptr, uint32_t size, void (*callback)(void *, uint
 	/* Deassert&assert rts_n, falling edge triggers wake up the RF core */
 	wake_es0(uart_dev);
 
-#if CONFIG_UART_ASYNC_API
+#if CONFIG_UART_ASYNC_API && 1
 	/* Enable RX with DMA and timeout */
-	int ret = uart_rx_enable(uart_dev, bufptr, size, RX_TIMEOUT_US);
+	if (!uart_env.rx_enabled) {
+		int ret = uart_rx_enable(uart_dev, rx_buffer[pingpong], BUFF_SIZE, RX_TIMEOUT_US);
 
-	if (ret < 0) {
-		LOG_ERR("Failed to enable UART RX: %d", ret);
-		/* If enabling RX fails, call the callback with error */
-		if (callback) {
-			callback(dummy, ITF_STATUS_ERROR);
-			uart_env.rx.callback = NULL;
-			uart_env.rx.dummy = NULL;
-			rx_buf_ptr = NULL;
-			rx_buf_size = 0;
+		if (ret < 0) {
+			LOG_ERR("Failed to enable UART RX: %d", ret);
+			/* If enabling RX fails, call the callback with error */
+			if (callback) {
+				callback(dummy, ITF_STATUS_ERROR);
+				uart_env.rx.callback = NULL;
+				uart_env.rx.dummy = NULL;
+				rx_buf_ptr = NULL;
+				rx_buf_size = 0;
+			}
+			return;
 		}
-		return;
+		uart_env.rx_enabled = true;
 	}
 
-	uart_env.rx_enabled = true;
+	hci_rx_job.buf = bufptr;
+	hci_rx_job.size = size;
+	hci_rx_job.callback = callback;
+	hci_rx_job.metadata = dummy;
+	k_work_submit_to_queue(&hci_worker_queue, &hci_rx_job.work);
+
 #else  /* No async UART */
 	uart_irq_rx_enable(uart_dev);
 #endif /* CONFIG_UART_ASYNC_API */
@@ -332,21 +343,11 @@ void hci_uart_write(uint8_t *bufptr, uint32_t size, void (*callback)(void *, uin
 	__ASSERT(size != 0, "Invalid size");
 	__ASSERT(callback != NULL, "Invalid callback");
 
-#if CONFIG_UART_ASYNC_API
-	/* If TX is already active, don't start a new transfer */
-	if (uart_env.tx_active) {
-		/* Call the callback with error status */
-		callback(dummy, ITF_STATUS_ERROR);
-		return;
-	}
-#endif /* CONFIG_UART_ASYNC_API */
-
 	/* Deassert&assert rts_n, falling edge triggers wake up the RF core */
 	wake_es0(uart_dev);
 
 	uart_env.tx.callback = callback;
 	uart_env.tx.dummy = dummy;
-
 
 #if CONFIG_UART_ASYNC_API
 	/* Start TX with DMA and timeout */
@@ -354,7 +355,17 @@ void hci_uart_write(uint8_t *bufptr, uint32_t size, void (*callback)(void *, uin
 
 	if (ret < 0) {
 		/* If starting TX fails, call the callback with error */
-		if (callback) {
+		if (callback != NULL) {
+			callback(dummy, ITF_STATUS_ERROR);
+			uart_env.tx.callback = NULL;
+			uart_env.tx.dummy = NULL;
+		}
+		return;
+	}
+	if (k_sem_take(&hci_tx_sem, K_USEC(TX_TIMEOUT_US)) != 0) {
+
+		LOG_ERR("TX SEM TO");
+		if (callback != NULL) {
 			callback(dummy, ITF_STATUS_ERROR);
 			uart_env.tx.callback = NULL;
 			uart_env.tx.dummy = NULL;
@@ -362,7 +373,11 @@ void hci_uart_write(uint8_t *bufptr, uint32_t size, void (*callback)(void *, uin
 		return;
 	}
 
-	uart_env.tx_active = true;
+	if (callback != NULL) {
+		uart_env.tx.callback = NULL;
+		uart_env.tx.dummy = NULL;
+		callback(dummy, ITF_STATUS_OK);
+	}
 #else  /* No async UART */
 
 	for (int i = 0; i < size; i++) {
@@ -391,4 +406,3 @@ bool hci_uart_flow_off(void)
 	/* TODO */
 	return true;
 }
-
