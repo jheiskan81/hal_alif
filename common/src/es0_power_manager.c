@@ -13,7 +13,6 @@
 #include "alif_protocol_const.h"
 
 static volatile uint8_t es0_user_counter;
-static uint32_t wakeup_count;
 
 #define LL_BOOT_PARAMS_MAX_SIZE (512)
 
@@ -318,25 +317,23 @@ int8_t stop_using_es0(void)
 
 void wake_es0(const struct device *uart_dev)
 {
-	if (wakeup_count == 0) {
-		uint32_t rts, cts;
+	uint32_t rts, cts;
 
-		/* Read RTS and CTS line */
-		uart_line_ctrl_get(uart_dev, UART_LINE_CTRL_RTS, &rts);
-		uart_line_ctrl_get(uart_dev, UART_LINE_MODEM_CTS, &cts);
+	/* Read RTS and CTS line */
+	uart_line_ctrl_get(uart_dev, UART_LINE_CTRL_RTS, &rts);
+	uart_line_ctrl_get(uart_dev, UART_LINE_MODEM_CTS, &cts);
 
-		if (cts == 0) {
-			if (rts) {
-				uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_RTS, 0);
-				k_usleep(100);
-			}
-			uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_RTS, 1);
-			uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_AFCE, 1);
-			wakeup_count++;
-		} else if (rts == 0) {
-			uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_RTS, 1);
-			uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_AFCE, 1);
-			wakeup_count++;
+	if (cts == 0) {
+		/* Wakeup Riscv by low CTS line */
+		if (rts) {
+			uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_RTS, 0);
+			k_usleep(100);
 		}
+		uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_RTS, 1);
+		uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_AFCE, 1);
+	} else if (rts == 0) {
+		/* Init Device state */
+		uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_RTS, 1);
+		uart_line_ctrl_set(uart_dev, UART_LINE_CTRL_AFCE, 1);
 	}
 }
