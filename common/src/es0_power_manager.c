@@ -13,6 +13,7 @@
 #include "alif_protocol_const.h"
 
 static volatile uint8_t es0_user_counter;
+static bool es0_rf_hpa_enabled = IS_ENABLED(CONFIG_ALIF_HPA_MODE) ? 1 : 0;
 
 #define LL_BOOT_PARAMS_MAX_SIZE (512)
 
@@ -46,6 +47,7 @@ static volatile uint8_t es0_user_counter;
 #define BOOT_PARAM_ID_EXT_WARMBOOT_WAKEUP_TIME  0xD0
 #define BOOT_PARAM_ID_LPCLK_DRIFT               0x07
 #define BOOT_PARAM_ID_ACTCLK_DRIFT              0x09
+#define BOOT_PARAM_ID_CONFIGURATION             0xD1
 
 #define BOOT_PARAM_LEN_LE_CODED_PHY_500          1
 #define BOOT_PARAM_LEN_DFT_SLAVE_MD              1
@@ -65,6 +67,7 @@ static volatile uint8_t es0_user_counter;
 #define BOOT_PARAM_LEN_EXT_WARMBOOT_WAKEUP_TIME  2
 #define BOOT_PARAM_LEN_LPCLK_DRIFT               2
 #define BOOT_PARAM_LEN_ACTCLK_DRIFT              1
+#define BOOT_PARAM_LEN_CONFIGURATION             4
 
 #define ES0_PM_ERROR_NO_ERROR             0
 #define ES0_PM_ERROR_TOO_MANY_USERS       -1
@@ -137,6 +140,11 @@ static void alif_eui48_read(uint8_t *eui48)
 static uint16_t add_nvds_param_length(uint16_t added_len){
 	return (added_len +3); /* Each write_tlv_x call writes additional 3 bytes */
 
+}
+
+void es0_rf_hpa_ctrl(bool enable_hpa)
+{
+	es0_rf_hpa_enabled = enable_hpa;
 }
 
 int8_t take_es0_into_use(void)
@@ -212,6 +220,7 @@ int8_t take_es0_into_use(void)
 	total_length += add_nvds_param_length(BOOT_PARAM_LEN_EXT_WARMBOOT_WAKEUP_TIME);
 	total_length += add_nvds_param_length(BOOT_PARAM_LEN_LPCLK_DRIFT);
 	total_length += add_nvds_param_length(BOOT_PARAM_LEN_ACTCLK_DRIFT);
+	total_length += add_nvds_param_length(BOOT_PARAM_LEN_CONFIGURATION);
 
 	if (total_length > LL_BOOT_PARAMS_MAX_SIZE) {
 		return ES0_PM_ERROR_TOO_MANY_BOOT_PARAMS;
@@ -262,6 +271,9 @@ int8_t take_es0_into_use(void)
 			    BOOT_PARAM_LEN_LPCLK_DRIFT);
 	ptr = write_tlv_int(ptr, BOOT_PARAM_ID_ACTCLK_DRIFT, CONFIG_ALIF_MAX_ACTIVE_CLOCK_DRIFT,
 			    BOOT_PARAM_LEN_ACTCLK_DRIFT);
+	ptr = write_tlv_int(ptr, BOOT_PARAM_ID_CONFIGURATION,
+			    es0_rf_hpa_enabled,
+			    BOOT_PARAM_LEN_CONFIGURATION);
 
 	uint32_t min_uart_clk_freq = used_baudrate * 16;
 	uint32_t reg_uart_clk_cfg = LL_UART_CLK_SEL_CTRL_16MHZ;

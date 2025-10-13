@@ -53,4 +53,14 @@ int8_t stop_using_es0(void);
  */
 void wake_es0(const struct device *uart_dev);
 
+
+/**
+ * @brief Configure HPA/LPA setup
+ *
+ * API for control RF HPA/LPA.
+ *
+ * @param enable_hpa True enable HPA and false enable LPA
+ */
+void es0_rf_hpa_ctrl(bool enable_hpa);
+
 #endif /* __ES0_POWER_MANAGER_H__ */
