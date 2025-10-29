@@ -39,6 +39,7 @@ K_MUTEX_DEFINE(receive_mutex);
 
 /*AHI Protocol defines*/
 #define AHI_KE_MSG_TYPE 0x10
+#define AHI_DMA_TX_TIMEOUT 20000
 
 /**
  * @brief UART async event callback
@@ -136,14 +137,14 @@ static int alif_send_with_dma(const uint8_t *data_ptr, uint16_t length)
 #ifdef CONFIG_UART_ASYNC_API
 	/* Start TX with DMA and timeout */
 	LOG_DBG("Send %u", length);
-	int ret = uart_tx(uart_dev, data_ptr, length, 200);
+	int ret = uart_tx(uart_dev, data_ptr, length, AHI_DMA_TX_TIMEOUT);
 
 	if (ret < 0) {
 		/* If starting TX fails, call the callback with error */
 		LOG_ERR("TX send fail");
 		return ret;
 	}
-	if (k_sem_take(&ahi_tx_sem, K_USEC(200)) != 0) {
+	if (k_sem_take(&ahi_tx_sem, K_USEC(AHI_DMA_TX_TIMEOUT)) != 0) {
 
 		LOG_ERR("TX SEM TO");
 		return -ETIME;
